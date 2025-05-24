@@ -11,6 +11,7 @@ import (
 type Config struct {
 	PostgresConfig PostgresConfig `yaml:"postgres"`
 	ServerConfig   ServerConfig   `yaml:"server"`
+	JWTSecret      string         `yaml:"jwt_secret"`
 }
 
 type PostgresConfig struct {

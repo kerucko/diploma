@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/Masterminds/squirrel"
-	"github.com/kerucko/diploma/internal/config"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kerucko/diploma/gateway/internal/config"
 )
 
 var (
