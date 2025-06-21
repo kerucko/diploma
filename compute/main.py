@@ -1,13 +1,9 @@
-"""
-Сервис решения задач смешанно-целочисленного линейного программирования.
-Получает задачи из топика Kafka 'tasks', решает их с помощью Pyomo
-и отправляет результаты в топик 'completed'.
-"""
-
 import json
 import logging
 from typing import Dict, Any, Optional, Tuple
 import uuid
+import random
+import math
 
 from confluent_kafka import Consumer, Producer, KafkaError, KafkaException
 import pyomo.environ as pyo
@@ -20,7 +16,7 @@ logging.basicConfig(
 logger = logging.getLogger('kafka_pyomo_service')
 
 KAFKA_CONFIG = {
-    'bootstrap.servers': 'localhost:9092',
+    'bootstrap.servers': 'localhost:29092',
     'group.id': 'pyomo_solver_group',
     'auto.offset.reset': 'earliest'
 }
@@ -28,26 +24,15 @@ KAFKA_CONFIG = {
 SOLVER_NAME = 'glpk'  
 
 class TaskType:
-    """Типы задач, которые может обрабатывать сервис."""
     MILP = 'milp'  # Mixed-Integer Linear Programming
     LP = 'lp'      # Linear Programming
     
 class KafkaPyomoService:
-    """Сервис для решения задач оптимизации с использованием Pyomo и Kafka."""
-    
     def __init__(self, kafka_config: Dict[str, str], 
                  input_topic: str = 'tasks', 
                  output_topic: str = 'completed',
                  solver_name: str = SOLVER_NAME):
-        """
-        Инициализация сервиса.
-        
-        Args:
-            kafka_config: Конфигурация Kafka
-            input_topic: Топик для входящих задач
-            output_topic: Топик для отправки результатов
-            solver_name: Имя солвера для решения задач
-        """
+
         self.kafka_config = kafka_config
         self.input_topic = input_topic
         self.output_topic = output_topic
@@ -59,9 +44,11 @@ class KafkaPyomoService:
         if not SolverFactory(solver_name).available():
             logger.error(f"Солвер {solver_name} недоступен!")
             raise ValueError(f"Солвер {solver_name} недоступен!")
+        
+        self.supported_solvers = [SOLVER_NAME, 'sa']
+
             
     def start(self):
-        """Запуск сервиса."""
         try:
             self.consumer.subscribe([self.input_topic])
             logger.info(f"Сервис запущен и прослушивает топик '{self.input_topic}'")
@@ -102,15 +89,6 @@ class KafkaPyomoService:
             self.consumer.close()
             
     def _solve_task(self, task_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Решает задачу оптимизации с помощью Pyomo.
-        
-        Args:
-            task_data: Данные задачи (id, type, task)
-            
-        Returns:
-            Dict с результатами решения
-        """
         task_id = task_data['id']
         task_type = task_data['type']
         task = task_data['task']
@@ -123,6 +101,14 @@ class KafkaPyomoService:
                 'message': f'Неподдерживаемый тип задачи: {task_type}'
             }
         
+        solver_type = task_data.get('solver', self.solver_name)
+        if solver_type not in self.supported_solvers:
+            return {'status': 'error', 'message': f"Солвер '{solver_type}' не поддерживается"}
+
+        if solver_type == 'sa':
+            return self._solve_with_sa(task_data['task'])
+
+                
         try:
             model, error = self._create_model_from_json(task, task_type)
             
@@ -178,17 +164,6 @@ class KafkaPyomoService:
             }
     
     def _create_model_from_json(self, task_json: Dict[str, Any], task_type: str) -> Tuple[Optional[pyo.ConcreteModel], Optional[str]]:
-        """
-        Создает модель Pyomo из JSON-описания задачи.
-        
-        Args:
-            task_json: JSON-описание задачи
-            task_type: Тип задачи (MILP или LP)
-            
-        Returns:
-            Кортеж (модель Pyomo, сообщение об ошибке)
-            Если ошибки нет, то второй элемент кортежа - None
-        """
         try:
             required_fields = ['variables', 'objective', 'constraints']
             if not all(field in task_json for field in required_fields):
@@ -236,18 +211,96 @@ class KafkaPyomoService:
         except Exception as e:
             logger.error(f"Ошибка при создании модели: {e}")
             return None, str(e)
+
+    def _solve_with_sa(self, task_json: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            vars_info = task_json['variables']
+            objective_expr = task_json['objective']['expression']
+            constraints = task_json['constraints']
+            sense = task_json['objective'].get('sense', 'min')
+
+            def evaluate(assignment):
+                model_mock = type('MockModel', (), assignment)
+                return self._parse_expression(model_mock, objective_expr)
+
+            def is_feasible(assignment):
+                model_mock = type('MockModel', (), assignment)
+                for cons in constraints:
+                    lhs = self._parse_expression(model_mock, cons['lhs'])
+                    rhs = self._parse_expression(model_mock, cons['rhs'])
+                    if cons['sense'] == '==':
+                        if abs(lhs - rhs) > 1e-5: return False
+                    elif cons['sense'] == '<=':
+                        if lhs > rhs + 1e-5: return False
+                    elif cons['sense'] == '>=':
+                        if lhs < rhs - 1e-5: return False
+                    else:
+                        return False
+                return True
+
+            current = {}
+            for var, props in vars_info.items():
+                lb = props.get('lb', 0)
+                ub = props.get('ub', 10)
+                domain = props.get('domain', 'continuous')
+                if domain == 'binary':
+                    current[var] = random.choice([0, 1])
+                elif domain == 'integer':
+                    current[var] = random.randint(int(lb), int(ub))
+                else:
+                    current[var] = random.uniform(lb, ub)
+
+            best = current.copy()
+            best_val = evaluate(best) if is_feasible(best) else float('inf')
+
+            T = 100.0
+            T_min = 1e-3
+            alpha = 0.95
+
+            while T > T_min:
+                for _ in range(100):
+                    new = current.copy()
+                    var_to_change = random.choice(list(vars_info.keys()))
+                    domain = vars_info[var_to_change].get('domain', 'continuous')
+                    lb = vars_info[var_to_change].get('lb', 0)
+                    ub = vars_info[var_to_change].get('ub', 10)
+
+                    if domain == 'binary':
+                        new[var_to_change] = 1 - current[var_to_change]
+                    elif domain == 'integer':
+                        new[var_to_change] = max(min(current[var_to_change] + random.randint(-3, 3), ub), lb)
+                    else:
+                        new[var_to_change] = max(min(current[var_to_change] + random.uniform(-1, 1), ub), lb)
+
+                    if not is_feasible(new):
+                        continue
+
+                    new_val = evaluate(new)
+                    cur_val = evaluate(current)
+                    delta = new_val - cur_val if sense == 'min' else cur_val - new_val
+
+                    if delta < 0 or random.random() < math.exp(-delta / T):
+                        current = new
+                        if ((sense == 'min' and new_val < best_val) or
+                            (sense == 'max' and new_val > best_val)):
+                            best = new
+                            best_val = new_val
+                T *= alpha
+
+            return {
+                'status': 'success',
+                'objective_value': best_val,
+                'variables': {k: {'0': v} for k, v in best.items()},
+                'solver_status': 'simulated_annealing',
+                'termination_condition': 'final_temperature_reached'
+            }
+
+        except Exception as e:
+            logger.error(f"Ошибка SA: {e}")
+            return {'status': 'error', 'message': str(e)}
+
     
     def _parse_expression(self, model, expression):
-        """
-        Парсит выражение из JSON в выражение Pyomo.
-        
-        Args:
-            model: Модель Pyomo
-            expression: Выражение в виде словаря или числа
-            
-        Returns:
-            Выражение Pyomo
-        """
         if isinstance(expression, (int, float)):
             return expression
             
@@ -282,13 +335,6 @@ class KafkaPyomoService:
         raise ValueError(f"Не удалось распознать выражение: {expression}")
         
     def _send_solution(self, task_id: str, solution: Dict[str, Any]):
-        """
-        Отправляет решение задачи в выходной топик Kafka.
-        
-        Args:
-            task_id: Идентификатор задачи
-            solution: Решение задачи
-        """
         result = {
             'id': task_id,
             'solution': solution,
@@ -309,7 +355,6 @@ class KafkaPyomoService:
             logger.error(f"Ошибка при отправке результата в Kafka: {e}")
             
     def _delivery_report(self, err, msg):
-        """Callback для подтверждения доставки сообщения."""
         if err is not None:
             logger.error(f"Ошибка доставки сообщения: {err}")
         else:
@@ -317,7 +362,6 @@ class KafkaPyomoService:
 
 
 def main():
-    """Точка входа в приложение."""
     try:
         service = KafkaPyomoService(KAFKA_CONFIG)
         service.start()

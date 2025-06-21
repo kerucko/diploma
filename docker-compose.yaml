@@ -35,9 +35,10 @@ services:
 
   compute-kafka:
     container_name: compute-kafka
-    image: confluentinc/cp-kafka:7.7.1.arm64
+    image: confluentinc/cp-kafka:7.7.1
     ports:
       - "9092:9092"
+      - "29092:29092"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
@@ -60,7 +61,7 @@ services:
 
   kafka-init-topics:
     container_name: init-topics
-    image: confluentinc/cp-kafka:7.7.1.arm64
+    image: confluentinc/cp-kafka:7.7.1
     depends_on:
       - compute-kafka
     command: "bash -c 'echo Waiting for Kafka to be ready... && \
